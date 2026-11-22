@@ -327,6 +327,9 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 	// 6. Commit state to .DepotDownloader (only when full manifest was targeted)
 	if patternRegexp == nil {
+		if progressTracker != nil {
+			progressTracker.Close()
+		}
 		if err := d.stateStore.CommitDepot(depotID, gid, m.RawData); err != nil {
 			log.Printf("[Downloader] Warning: failed to commit state for depot %d: %v", depotID, err)
 		}

@@ -90,14 +90,17 @@ func (s *StateStore) CommitDepot(depotID uint32, gid uint64, rawManifest []byte)
 		_ = os.WriteFile(cachePath, rawManifest, 0644)
 	}
 
-	// 2. Remove obsolete manifest cache files for this depot
+	// 2. Remove obsolete manifest and progress files for this depot
 	entries, _ := os.ReadDir(s.rootDir)
 	prefix := fmt.Sprintf("%d_", depotID)
 	currentName := filepath.Base(cachePath)
 	for _, entry := range entries {
 		name := entry.Name()
-		if len(name) > len(prefix) && name[:len(prefix)] == prefix && filepath.Ext(name) == ".manifest" {
-			if name != currentName {
+		if len(name) > len(prefix) && name[:len(prefix)] == prefix {
+			if filepath.Ext(name) == ".manifest" && name != currentName {
+				_ = os.Remove(filepath.Join(s.rootDir, name))
+			}
+			if filepath.Ext(name) == ".progress" {
 				_ = os.Remove(filepath.Join(s.rootDir, name))
 			}
 		}
