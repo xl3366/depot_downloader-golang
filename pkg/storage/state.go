@@ -1,10 +1,13 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"depotdownloader-go/pkg/manifest"
@@ -115,5 +118,87 @@ func (s *StateStore) CommitDepot(depotID uint32, gid uint64, rawManifest []byte)
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 		return err
 	}
+	_ = os.Remove(s.ProgressFilePath(depotID, gid))
 	return os.Rename(tmpPath, s.statePath)
+}
+
+func (s *StateStore) ProgressFilePath(depotID uint32, gid uint64) string {
+	return filepath.Join(s.rootDir, fmt.Sprintf("%d_%d.progress", depotID, gid))
+}
+
+func (s *StateStore) LoadProgress(depotID uint32, gid uint64) map[string]bool {
+	completed := make(map[string]bool)
+	path := s.ProgressFilePath(depotID, gid)
+	f, err := os.Open(path)
+	if err != nil {
+		return completed
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			completed[line] = true
+		}
+	}
+	return completed
+}
+
+type ProgressTracker struct {
+	mu    sync.Mutex
+	f     *os.File
+	w     *bufio.Writer
+	count int
+	path  string
+}
+
+func (s *StateStore) NewProgressTracker(depotID uint32, gid uint64) (*ProgressTracker, error) {
+	if err := os.MkdirAll(s.rootDir, 0755); err != nil {
+		return nil, err
+	}
+	path := s.ProgressFilePath(depotID, gid)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	return &ProgressTracker{
+		f:    f,
+		w:    bufio.NewWriterSize(f, 32*1024),
+		path: path,
+	}, nil
+}
+
+func (pt *ProgressTracker) Record(shaHex string) {
+	if pt == nil || shaHex == "" {
+		return
+	}
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	_, _ = pt.w.WriteString(shaHex)
+	_ = pt.w.WriteByte('\n')
+	pt.count++
+	if pt.count%10 == 0 {
+		_ = pt.w.Flush()
+	}
+}
+
+func (pt *ProgressTracker) Close() {
+	if pt == nil || pt.f == nil {
+		return
+	}
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	_ = pt.w.Flush()
+	_ = pt.f.Close()
+	pt.f = nil
+}
+
+func (pt *ProgressTracker) Remove() {
+	if pt == nil {
+		return
+	}
+	pt.Close()
+	_ = os.Remove(pt.path)
 }

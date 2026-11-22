@@ -99,7 +99,20 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 		patternRegexp = re
 	}
 
-	// 2. Plan files and chunks
+	// 2. Load progress cache (instant resume for HDD without scanning gigabytes of files)
+	completedChunks := d.stateStore.LoadProgress(depotID, gid)
+	if len(completedChunks) > 0 {
+		log.Printf("[Downloader] Found resume cache with %d previously completed chunk(s). Fast resuming...", len(completedChunks))
+	}
+	progressTracker, err := d.stateStore.NewProgressTracker(depotID, gid)
+	if err != nil {
+		log.Printf("[Downloader] Warning: could not initialize progress tracker: %v", err)
+	}
+	if progressTracker != nil {
+		defer progressTracker.Close()
+	}
+
+	// 3. Plan files and chunks
 	var totalBytes uint64
 	var pendingChunks []*chunkWorkItem
 	var openFiles []*os.File
@@ -172,16 +185,23 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 		// Plan chunks: Check existing chunks for breakpoint resume
 		for _, chunk := range fileEntry.Chunks {
+			shaHex := chunk.ShaHex()
 			needDownload := true
 
-			// Check if chunk already exists and is valid on disk
-			if statErr == nil && fi.Size() >= int64(chunk.Offset+uint64(chunk.CbOriginal)) {
+			// Fast path 1: Instant memory cache (0 disk I/O, protects HDDs from seeking)
+			if completedChunks[shaHex] {
+				needDownload = false
+			} else if statErr == nil && fi.Size() >= int64(chunk.Offset+uint64(chunk.CbOriginal)) {
+				// Fallback 2: On-disk physical Adler32 verification
 				buf := make([]byte, chunk.CbOriginal)
 				n, err := f.ReadAt(buf, int64(chunk.Offset))
 				if err == nil && uint32(n) == chunk.CbOriginal {
 					if crypto.Adler32Seed0(buf) == chunk.Crc {
 						// Chunk already intact on disk!
 						needDownload = false
+						if progressTracker != nil {
+							progressTracker.Record(shaHex)
+						}
 					}
 				}
 			}
@@ -266,6 +286,9 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 					default:
 					}
 					return
+				}
+				if progressTracker != nil {
+					progressTracker.Record(item.chunk.ShaHex())
 				}
 				pb.add(uint64(item.chunk.CbOriginal))
 			}
