@@ -101,8 +101,9 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 	// 2. Load progress cache (instant resume for HDD without scanning gigabytes of files)
 	completedChunks := d.stateStore.LoadProgress(depotID, gid)
-	if len(completedChunks) > 0 {
-		log.Printf("[Downloader] Found resume cache with %d previously completed chunk(s). Fast resuming...", len(completedChunks))
+	hasResumeCache := len(completedChunks) > 0
+	if hasResumeCache {
+		log.Printf("[Downloader] Found resume cache with %d previously completed chunk(s). Fast resuming without disk scanning...", len(completedChunks))
 	}
 	progressTracker, err := d.stateStore.NewProgressTracker(depotID, gid)
 	if err != nil {
@@ -188,11 +189,13 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 			shaHex := chunk.ShaHex()
 			needDownload := true
 
-			// Fast path 1: Instant memory cache (0 disk I/O, protects HDDs from seeking)
-			if completedChunks[shaHex] {
-				needDownload = false
+			if hasResumeCache {
+				// Fast path 1: Instant memory cache lookup (0 disk I/O! 100% RAM, instant on HDD)
+				if completedChunks[shaHex] {
+					needDownload = false
+				}
 			} else if statErr == nil && fi.Size() >= int64(chunk.Offset+uint64(chunk.CbOriginal)) {
-				// Fallback 2: On-disk physical Adler32 verification
+				// Fallback 2: On-disk physical Adler32 verification (only if no progress cache exists)
 				buf := make([]byte, chunk.CbOriginal)
 				n, err := f.ReadAt(buf, int64(chunk.Offset))
 				if err == nil && uint32(n) == chunk.CbOriginal {
