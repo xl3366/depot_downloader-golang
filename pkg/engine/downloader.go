@@ -141,12 +141,16 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 		totalBytes += fileEntry.Size
 
-		// Incremental check: if same content hash and file exists with exact size, skip completely
+		// Incremental check: only skip completely if updating from an older DIFFERENT manifest GID.
+		// If oldManifest GID is the same as current manifest GID, we do NOT skip here because a previous run on the
+		// same manifest could have been interrupted (e.g. via Ctrl+C) after files were truncated.
+		// Instead, we let it fall through to the chunk-level Adler32 check below, which safely and swiftly verifies
+		// on-disk chunks and only downloads missing pieces.
 		fi, statErr := os.Stat(targetPath)
 		if statErr == nil && uint64(fi.Size()) == fileEntry.Size && !opt.VerifyIntegrity {
 			if oldFile, ok := oldFileMap[fileEntry.Filename]; ok {
-				if bytes.Equal(oldFile.ShaContent, fileEntry.ShaContent) && len(fileEntry.ShaContent) > 0 {
-					// Perfectly identical across manifests, no need to touch
+				if oldManifest != nil && oldManifest.Metadata.GidManifest != m.Metadata.GidManifest && bytes.Equal(oldFile.ShaContent, fileEntry.ShaContent) && len(fileEntry.ShaContent) > 0 {
+					// Perfectly identical across different manifests, no need to touch
 					continue
 				}
 			}
@@ -271,6 +275,10 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 	wg.Wait()
 	close(errChan)
 	pb.finish()
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	if err, ok := <-errChan; ok {
 		return fmt.Errorf("chunk download failed: %w", err)

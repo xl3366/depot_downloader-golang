@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -331,8 +332,17 @@ func main() {
 
 		log.Printf("[Main] [%d/%d] Processing depot %d...", idx+1, len(manifests), m.Metadata.DepotID)
 		if err := downloader.DownloadManifest(ctx, m, key, opts); err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				log.Println("[Main] Download cancelled by user.")
+				return
+			}
 			log.Fatalf("[Main] Download failed for depot %d: %v", m.Metadata.DepotID, err)
 		}
+	}
+
+	if ctx.Err() != nil {
+		log.Println("[Main] Download cancelled by user.")
+		return
 	}
 
 	log.Println("[Main] All depot downloads finished successfully!")
