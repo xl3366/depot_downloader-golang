@@ -102,10 +102,17 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 	}
 
 	// 2. Load progress cache (instant resume for HDD without scanning gigabytes of files)
-	completedChunks := d.stateStore.LoadProgress(depotID, gid)
-	hasResumeCache := len(completedChunks) > 0
-	if hasResumeCache {
-		log.Printf("[Downloader] Found resume cache with %d previously completed chunk(s). Fast resuming without disk scanning...", len(completedChunks))
+	// ONLY use fast resume cache when -i (VerifyIntegrity) is FALSE!
+	var completedChunks map[string]bool
+	hasResumeCache := false
+	if !opt.VerifyIntegrity {
+		completedChunks = d.stateStore.LoadProgress(depotID, gid)
+		hasResumeCache = len(completedChunks) > 0
+		if hasResumeCache {
+			log.Printf("[Downloader] Found resume cache with %d previously completed chunk(s). Fast resuming without disk scanning...", len(completedChunks))
+		}
+	} else {
+		log.Printf("[Verify] Integrity verification mode enabled (-i): validating files on disk against manifest...")
 	}
 	progressTracker, err := d.stateStore.NewProgressTracker(depotID, gid)
 	if err != nil {
@@ -154,11 +161,8 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 		totalBytes += fileEntry.Size
 
-		// Incremental check: only skip completely if updating from an older DIFFERENT manifest GID.
-		// If oldManifest GID is the same as current manifest GID, we do NOT skip here because a previous run on the
-		// same manifest could have been interrupted (e.g. via Ctrl+C) after files were truncated.
-		// Instead, we let it fall through to the chunk-level Adler32 check below, which safely and swiftly verifies
-		// on-disk chunks and only downloads missing pieces.
+		// Incremental check: only skip completely if updating from an older DIFFERENT manifest GID,
+		// and ONLY if -i is not requested.
 		fi, statErr := os.Stat(targetPath)
 		if statErr == nil && uint64(fi.Size()) == fileEntry.Size && !opt.VerifyIntegrity {
 			if oldFile, ok := oldFileMap[fileEntry.Filename]; ok {
@@ -167,6 +171,29 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 					continue
 				}
 			}
+		}
+
+		// Fast file-level verification:
+		// If verifying integrity (-i) and file exists with matching size and ShaContent:
+		fileFullyValid := false
+		if opt.VerifyIntegrity && statErr == nil && uint64(fi.Size()) == fileEntry.Size && len(fileEntry.ShaContent) > 0 {
+			if err := verifyFileSha1(targetPath, fileEntry.ShaContent); err == nil {
+				fileFullyValid = true
+				if progressTracker != nil {
+					for _, chunk := range fileEntry.Chunks {
+						progressTracker.Record(chunk.ShaHex())
+					}
+				}
+			} else {
+				log.Printf("[Verify] File '%s' checksum mismatch or corrupted, checking chunk details for repair...", fileEntry.Filename)
+			}
+		}
+
+		if fileFullyValid {
+			if fileEntry.IsExecutable() {
+				_ = os.Chmod(targetPath, 0755)
+			}
+			continue
 		}
 
 		// Open file for random writes
@@ -183,7 +210,7 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 			}
 		}
 
-		// Plan chunks: Check existing chunks for breakpoint resume
+		// Plan chunks: Check existing chunks for breakpoint resume or integrity repair
 		for _, chunk := range fileEntry.Chunks {
 			shaHex := chunk.ShaHex()
 			needDownload := true
@@ -194,7 +221,7 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 					needDownload = false
 				}
 			} else if statErr == nil && fi.Size() >= int64(chunk.Offset+uint64(chunk.CbOriginal)) {
-				// Fallback 2: On-disk physical Adler32 verification (only if no progress cache exists)
+				// Fallback 2: On-disk physical Adler32 verification (when no resume cache or in -i mode)
 				buf := make([]byte, chunk.CbOriginal)
 				n, err := f.ReadAt(buf, int64(chunk.Offset))
 				if err == nil && uint32(n) == chunk.CbOriginal {
@@ -228,9 +255,17 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 		depotID, formatBytes(totalBytes), len(pendingChunks))
 
 	if len(pendingChunks) == 0 {
-		log.Printf("[Downloader] Depot %d is already fully up to date! Committing state.", depotID)
+		if opt.VerifyIntegrity {
+			log.Printf("[Verify] Depot %d verification passed: 100%% validated! All files match manifest.", depotID)
+		} else {
+			log.Printf("[Downloader] Depot %d is already fully up to date! Committing state.", depotID)
+		}
 		_ = d.stateStore.CommitDepot(depotID, gid, m.RawData)
 		return nil
+	}
+
+	if opt.VerifyIntegrity {
+		log.Printf("[Verify] Depot %d verification detected %d missing/corrupted chunk(s). Downloading repair chunks...", depotID, len(pendingChunks))
 	}
 
 	// 4. Download chunks concurrently
@@ -306,7 +341,7 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 	// 5. Verification step if requested
 	if opt.VerifyIntegrity {
-		log.Printf("[Downloader] Verifying integrity of downloaded files...")
+		log.Printf("[Verify] Depot %d verifying repaired files...", depotID)
 		for _, f := range m.Files {
 			if f.IsDirectory() || f.IsSymlink() || len(f.ShaContent) == 0 {
 				continue
@@ -319,7 +354,7 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 				return fmt.Errorf("file verification failed for %s: %w", f.Filename, err)
 			}
 		}
-		log.Printf("[Downloader] Verification passed for all files.")
+		log.Printf("[Verify] Depot %d verification passed: all files match manifest checksums (100%% OK).", depotID)
 	}
 
 	// 6. Commit state to .DepotDownloader (only when full manifest was targeted)
@@ -345,6 +380,10 @@ func (d *Downloader) downloadChunkWithRetry(ctx context.Context, item *chunkWork
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+
+		if d.serverPool == nil {
+			return fmt.Errorf("no server pool available")
 		}
 
 		server := d.serverPool.GetServer()
@@ -509,7 +548,8 @@ func verifyFileSha1(path string, expectedSha []byte) error {
 	defer f.Close()
 
 	h := sha1.New()
-	if _, err := io.Copy(h, f); err != nil {
+	buf := make([]byte, 2*1024*1024)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
 		return err
 	}
 

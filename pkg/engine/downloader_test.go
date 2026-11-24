@@ -179,3 +179,65 @@ func makeDummyChunk(data []byte, offset uint64) *manifest.ChunkData {
 		CbOriginal: uint32(len(data)),
 	}
 }
+
+func TestVerifyIntegrityDetectsCorruption(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "depot_verify_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	data := []byte("Valid game content for SHA-1 and chunk checking 1234567890")
+	filePath := filepath.Join(tempDir, "game.bin")
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	chunk := makeDummyChunk(data, 0)
+	m := &manifest.DepotManifest{
+		Metadata: &manifest.ContentManifestMetadata{
+			DepotID:     12345,
+			GidManifest: 99999,
+		},
+		Files: []*manifest.FileMapping{
+			{
+				Filename:   "game.bin",
+				Size:       uint64(len(data)),
+				ShaContent: sha1Bytes(data),
+				Chunks:     []*manifest.ChunkData{chunk},
+			},
+		},
+	}
+
+	state := storage.LoadState(tempDir)
+	// Create downloader with nil servers (no network)
+	d := engine.NewDownloader(nil, nil, state)
+
+	// 1. Valid file: should pass verification without needing any chunk downloads
+	opts := engine.DownloadOptions{
+		OutputDir:       tempDir,
+		VerifyIntegrity: true,
+	}
+	err = d.DownloadManifest(t.Context(), m, make([]byte, 32), opts)
+	if err != nil {
+		t.Fatalf("expected valid file to pass verification, got error: %v", err)
+	}
+
+	// 2. Corrupt the file on disk
+	corruptData := []byte("Corrupted file content for testing verify integrity failure")
+	if err := os.WriteFile(filePath, corruptData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Also simulate progress cache was saved from previous run
+	tracker, _ := state.NewProgressTracker(12345, 99999)
+	tracker.Record(chunk.ShaHex())
+	tracker.Close()
+
+	// 3. Run with VerifyIntegrity: true. It MUST detect corruption and NOT use resume cache!
+	// It will attempt to download the repair chunk and fail because pool is nil, proving it detected corruption!
+	err = d.DownloadManifest(t.Context(), m, make([]byte, 32), opts)
+	if err == nil {
+		t.Fatalf("expected corrupted file to be detected in -i mode, but it falsely succeeded")
+	}
+}
