@@ -66,6 +66,17 @@ func (s *StateStore) GetInstalledGid(depotID uint32) (uint64, bool) {
 	return state.Gid, true
 }
 
+func (s *StateStore) GetInstalledDepots() []uint32 {
+	var depots []uint32
+	for k := range s.state.Depots {
+		var id uint32
+		if _, err := fmt.Sscanf(k, "%d", &id); err == nil {
+			depots = append(depots, id)
+		}
+	}
+	return depots
+}
+
 func (s *StateStore) ManifestCachePath(depotID uint32, gid uint64) string {
 	return filepath.Join(s.rootDir, fmt.Sprintf("%d_%d.manifest", depotID, gid))
 }

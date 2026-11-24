@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -123,11 +125,8 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 		}
 	}()
 
-	manifestFilesSet := make(map[string]bool)
-
 	for _, fileEntry := range m.Files {
 		cleanName := filepath.Clean(fileEntry.Filename)
-		manifestFilesSet[cleanName] = true
 
 		if patternRegexp != nil && !patternRegexp.MatchString(fileEntry.Filename) {
 			continue
@@ -223,11 +222,6 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 		if fileEntry.IsExecutable() {
 			_ = os.Chmod(targetPath, 0755)
 		}
-	}
-
-	// 3. Handle delete unmatched if enabled
-	if opt.DeleteUnmatched && patternRegexp == nil {
-		d.cleanupUnmatched(outputDir, manifestFilesSet)
 	}
 
 	log.Printf("[Downloader] Depot %d planned: Total size: %s, Chunks to download: %d",
@@ -432,9 +426,14 @@ func (d *Downloader) downloadChunkWithRetry(ctx context.Context, item *chunkWork
 	return fmt.Errorf("failed to download chunk %s after %d retries: %w", shaHex, maxRetries, lastErr)
 }
 
-func (d *Downloader) cleanupUnmatched(outputDir string, manifestFiles map[string]bool) {
-	_ = filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+// CleanupUnmatched scans outputDir and deletes files that are not in allowedFiles.
+// It also cleans up any empty subdirectories leftover from deletions.
+func CleanupUnmatched(outputDir string, allowedFiles map[string]bool) (int, error) {
+	var deletedCount int
+	var dirsToCheck []string
+
+	err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
 			return nil
 		}
 		rel, err := filepath.Rel(outputDir, path)
@@ -442,15 +441,64 @@ func (d *Downloader) cleanupUnmatched(outputDir string, manifestFiles map[string
 			return nil
 		}
 		relClean := filepath.Clean(rel)
-		if strings.HasPrefix(relClean, storage.StateDirName) {
+		if relClean == "." {
 			return nil
 		}
-		if !manifestFiles[relClean] {
+		if relClean == storage.StateDirName || strings.HasPrefix(relClean, storage.StateDirName+string(filepath.Separator)) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if info.IsDir() {
+			dirsToCheck = append(dirsToCheck, path)
+			return nil
+		}
+
+		isAllowed := allowedFiles[relClean]
+		if !isAllowed && runtime.GOOS == "windows" {
+			isAllowed = allowedFiles[strings.ToLower(relClean)]
+		}
+
+		if !isAllowed {
 			log.Printf("[Cleanup] Removing unmatched file: %s", relClean)
-			_ = os.Remove(path)
+			if rmErr := os.Remove(path); rmErr == nil {
+				deletedCount++
+			}
 		}
 		return nil
 	})
+
+	if err != nil {
+		return deletedCount, err
+	}
+
+	// Remove empty subdirectories (deepest first)
+	sort.Slice(dirsToCheck, func(i, j int) bool {
+		return len(dirsToCheck[i]) > len(dirsToCheck[j])
+	})
+
+	for _, dir := range dirsToCheck {
+		rel, err := filepath.Rel(outputDir, dir)
+		if err != nil {
+			continue
+		}
+		relClean := filepath.Clean(rel)
+		if relClean == "." || relClean == storage.StateDirName || strings.HasPrefix(relClean, storage.StateDirName+string(filepath.Separator)) {
+			continue
+		}
+		isAllowed := allowedFiles[relClean]
+		if !isAllowed && runtime.GOOS == "windows" {
+			isAllowed = allowedFiles[strings.ToLower(relClean)]
+		}
+		if isAllowed {
+			continue
+		}
+		_ = os.Remove(dir)
+	}
+
+	return deletedCount, nil
 }
 
 func verifyFileSha1(path string, expectedSha []byte) error {

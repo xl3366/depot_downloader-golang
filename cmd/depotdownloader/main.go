@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -343,6 +344,55 @@ func main() {
 	if ctx.Err() != nil {
 		log.Println("[Main] Download cancelled by user.")
 		return
+	}
+
+	// Multi-depot cleanup if -d / --delete is enabled
+	if deleteUnmatched && regexPattern == "" {
+		log.Printf("[Cleanup] Checking for unmatched files across all depots...")
+		allowedFiles := make(map[string]bool)
+
+		// 1. Collect files from all manifests processed in this run
+		for _, m := range manifests {
+			for _, f := range m.Files {
+				cleanName := filepath.Clean(f.Filename)
+				allowedFiles[cleanName] = true
+				if runtime.GOOS == "windows" {
+					allowedFiles[strings.ToLower(cleanName)] = true
+				}
+			}
+		}
+
+		// 2. Also collect files from other already-installed depots in state store
+		for _, depotID := range stateStore.GetInstalledDepots() {
+			isCurrent := false
+			for _, m := range manifests {
+				if m.Metadata.DepotID == depotID {
+					isCurrent = true
+					break
+				}
+			}
+			if !isCurrent {
+				if installedManifest, err := stateStore.LoadInstalledManifest(depotID); err == nil && installedManifest != nil {
+					for _, f := range installedManifest.Files {
+						cleanName := filepath.Clean(f.Filename)
+						allowedFiles[cleanName] = true
+						if runtime.GOOS == "windows" {
+							allowedFiles[strings.ToLower(cleanName)] = true
+						}
+					}
+				}
+			}
+		}
+
+		// 3. Perform cleanup across outputDir
+		count, err := engine.CleanupUnmatched(outputDir, allowedFiles)
+		if err != nil {
+			log.Printf("[Cleanup] Warning: cleanup encountered error: %v", err)
+		} else if count > 0 {
+			log.Printf("[Cleanup] Successfully removed %d unmatched entry/entries.", count)
+		} else {
+			log.Printf("[Cleanup] No unmatched files found.")
+		}
 	}
 
 	log.Println("[Main] All depot downloads finished successfully!")
