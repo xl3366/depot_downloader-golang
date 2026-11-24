@@ -94,6 +94,53 @@ func TestIncrementalUpdateManifest(t *testing.T) {
 	}
 }
 
+func TestAlreadyCommittedSameManifestSkip(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "depot_same_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	data := []byte("Some existing file content on disk")
+	filePath := filepath.Join(tempDir, "game.exe")
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	depotID := uint32(2001)
+	gid := uint64(55555)
+
+	store := storage.LoadState(tempDir)
+	_ = store.CommitDepot(depotID, gid, nil)
+
+	m := &manifest.DepotManifest{
+		Metadata: &manifest.ContentManifestMetadata{
+			DepotID:     depotID,
+			GidManifest: gid,
+		},
+		Files: []*manifest.FileMapping{
+			{
+				Filename:   "game.exe",
+				Size:       uint64(len(data)),
+				ShaContent: sha1Bytes(data),
+				Chunks:     []*manifest.ChunkData{makeDummyChunk(data, 0)},
+			},
+		},
+	}
+
+	d := engine.NewDownloader(nil, nil, store)
+
+	// In non-verify mode (no -i), it should skip instantly with 0 downloads and no error even with nil server pool
+	opts := engine.DownloadOptions{
+		OutputDir:       tempDir,
+		VerifyIntegrity: false,
+	}
+	err = d.DownloadManifest(t.Context(), m, make([]byte, 32), opts)
+	if err != nil {
+		t.Fatalf("expected already committed depot to skip without error, got: %v", err)
+	}
+}
+
 func sha1Bytes(data []byte) []byte {
 	h := sha1.New()
 	h.Write(data)

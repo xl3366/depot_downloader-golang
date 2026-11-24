@@ -161,14 +161,21 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 
 		totalBytes += fileEntry.Size
 
-		// Incremental check: only skip completely if updating from an older DIFFERENT manifest GID,
-		// and ONLY if -i is not requested.
+		// Incremental / Already installed check:
+		// If depot was already installed and committed with this manifest (or an older manifest where files match),
+		// skip already completed files with matching size. ONLY if -i is not requested.
 		fi, statErr := os.Stat(targetPath)
 		if statErr == nil && uint64(fi.Size()) == fileEntry.Size && !opt.VerifyIntegrity {
-			if oldFile, ok := oldFileMap[fileEntry.Filename]; ok {
-				if oldManifest != nil && oldManifest.Metadata.GidManifest != m.Metadata.GidManifest && bytes.Equal(oldFile.ShaContent, fileEntry.ShaContent) && len(fileEntry.ShaContent) > 0 {
-					// Perfectly identical across different manifests, no need to touch
+			if oldManifest != nil {
+				if oldManifest.Metadata.GidManifest == m.Metadata.GidManifest {
+					// Fully installed at this manifest GID!
 					continue
+				}
+				if oldFile, ok := oldFileMap[fileEntry.Filename]; ok {
+					if bytes.Equal(oldFile.ShaContent, fileEntry.ShaContent) && len(fileEntry.ShaContent) > 0 {
+						// Perfectly identical across different manifests, no need to touch
+						continue
+					}
 				}
 			}
 		}
@@ -259,6 +266,10 @@ func (d *Downloader) DownloadManifest(ctx context.Context, m *manifest.DepotMani
 			log.Printf("[Verify] Depot %d verification passed: 100%% validated! All files match manifest.", depotID)
 		} else {
 			log.Printf("[Downloader] Depot %d is already fully up to date! Committing state.", depotID)
+		}
+		if progressTracker != nil {
+			progressTracker.Close()
+			progressTracker = nil
 		}
 		_ = d.stateStore.CommitDepot(depotID, gid, m.RawData)
 		return nil
